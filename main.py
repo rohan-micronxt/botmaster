@@ -1,30 +1,30 @@
-# Load .env variables automatically
-from dotenv import load_dotenv
-load_dotenv()
-import os
 """
 WhatsApp Vendor Passthrough Proxy
 Domain: botmaster.storenxt.in
-Proxies all requests to: https://api.botmastersender.com/api/v1/
+Proxies all requests to: https://api.botmastersender.com/api/v3/
+
+Multi-account token injection:
+  - Client sends { "accountId": "<name>", ... } — no authToken needed
+  - Proxy reads BOTMASTER_TOKEN_<NAME> from .env and injects authToken server-side
+  - To add a new account: add BOTMASTER_TOKEN_<NAME>=<token> to .env
 """
 
+import os
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from dotenv import load_dotenv
 import logging
 import time
 
+load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-import os
-# Optionally disable IP whitelist via environment variable
-DISABLE_IP_WHITELIST = os.getenv("DISABLE_IP_WHITELIST", "0").lower() in ("1", "true", "yes")
-
-VENDOR_BASE_URL = "https://api.botmastersender.com/api/v1/"
+VENDOR_BASE_URL = "https://api.botmastersender.com/api/v3/"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # IP WHITELIST
@@ -77,21 +77,26 @@ def get_client_ip(request: Request) -> str:
 class IPWhitelistMiddleware(BaseHTTPMiddleware):
     """
     Blocks all requests from IPs not in WHITELISTED_IPS.
-    Whitelisting is skipped entirely when WHITELISTED_IPS is empty or DISABLE_IP_WHITELIST is set.
+    Whitelisting is skipped entirely when WHITELISTED_IPS is empty or disabled via class attribute.
     The /health endpoint is always allowed through for uptime checks.
     """
 
     ALWAYS_ALLOWED_PATHS = {"/health"}
+    DISABLED = False  # Class-level toggle for disabling whitelist
+
+    @classmethod
+    def set_disabled(cls, value: bool):
+        cls.DISABLED = value
 
     async def dispatch(self, request: Request, call_next):
         # Skip check for health probe
         if request.url.path in self.ALWAYS_ALLOWED_PATHS:
             return await call_next(request)
 
-        # Skip check if whitelist is disabled via env or empty list
-        if DISABLE_IP_WHITELIST or not WHITELISTED_IPS:
-            if DISABLE_IP_WHITELIST:
-                logger.warning("IP whitelisting is DISABLED via environment variable — all IPs are allowed")
+        # Skip check if whitelist is disabled via class or empty list
+        if self.DISABLED or not WHITELISTED_IPS:
+            if self.DISABLED:
+                logger.warning("IP whitelisting is DISABLED via class attribute — all IPs are allowed")
             else:
                 logger.warning("IP whitelisting is DISABLED — all IPs are allowed")
             return await call_next(request)
@@ -136,6 +141,7 @@ app.add_middleware(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 SUPPORTED_ACTIONS = {
+    "sendtemplate",
     "demo_send_template",
     "demo_send_template_busy",
     "demo_send_template_direct",
@@ -143,18 +149,51 @@ SUPPORTED_ACTIONS = {
 }
 
 
-async def forward_to_vendor(action: str, body: dict, original_headers: dict) -> dict:
+def resolve_auth_token(body: dict) -> dict:
+    """
+    Inject authToken server-side from environment variables.
+
+    Client sends { "accountId": "srinath", ... }
+    Proxy looks up BOTMASTER_TOKEN_SRINATH from .env and injects authToken.
+
+    To add a new account, add to .env:
+        BOTMASTER_TOKEN_<ACCOUNTID_UPPERCASE>=<token>
+
+    If accountId is not provided, falls back to BOTMASTER_TOKEN_DEFAULT.
+    Raises HTTP 400 if no matching token is found.
+    """
+    body = dict(body)  # don't mutate caller's dict
+
+    # Remove accountId from body — vendor doesn't know about it
+    account_id = body.pop("accountId", "default").strip().upper()
+    env_key = f"BOTMASTER_TOKEN_{account_id}"
+    token = os.environ.get(env_key)
+
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "message": f"No token configured for accountId '{account_id.lower()}'. "
+                           f"Add {env_key}=<token> to the server .env file.",
+            },
+        )
+
+    body["authToken"] = token
+    return body
+
+
+async def forward_to_vendor(action: str, body: dict) -> dict:
     """Forward the request to the vendor API and return the response."""
     vendor_url = f"{VENDOR_BASE_URL}?action={action}"
 
-    # Forward only safe/relevant headers; strip host-specific ones
+    # Inject authToken from env — strips accountId, adds authToken
+    body = resolve_auth_token(body)
+
     forward_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    # Optionally pass through Authorization if present
-    if "authorization" in original_headers:
-        forward_headers["Authorization"] = original_headers["authorization"]
 
     logger.info(f"Forwarding action={action} to {vendor_url}")
     start = time.time()
@@ -179,7 +218,12 @@ async def forward_to_vendor(action: str, body: dict, original_headers: dict) -> 
 @app.get("/health")
 async def health(request: Request):
     client_ip = get_client_ip(request)
-    ip_whitelisting_status = "disabled (env)" if DISABLE_IP_WHITELIST else ("enabled" if WHITELISTED_IPS else "disabled")
+    if IPWhitelistMiddleware.DISABLED:
+        ip_whitelisting_status = "disabled (class)"
+    elif WHITELISTED_IPS:
+        ip_whitelisting_status = "enabled"
+    else:
+        ip_whitelisting_status = "disabled"
     return {
         "status": "ok",
         "proxy_target": VENDOR_BASE_URL,
@@ -194,7 +238,12 @@ async def health(request: Request):
 @app.get("/api/v1/whitelist")
 async def list_whitelist(request: Request):
     """View current whitelisted IPs. Accessible only from a whitelisted IP (enforced by middleware)."""
-    ip_whitelisting_status = "disabled (env)" if DISABLE_IP_WHITELIST else ("enabled" if WHITELISTED_IPS else "disabled")
+    if IPWhitelistMiddleware.DISABLED:
+        ip_whitelisting_status = "disabled (class)"
+    elif WHITELISTED_IPS:
+        ip_whitelisting_status = "enabled"
+    else:
+        ip_whitelisting_status = "disabled"
     return {
         "success": True,
         "ip_whitelisting": ip_whitelisting_status,
@@ -244,10 +293,8 @@ async def proxy_action(request: Request, action: Optional[str] = None):
             detail={"success": False, "message": "Invalid JSON body"},
         )
 
-    headers = dict(request.headers)
-
     try:
-        status_code, vendor_response = await forward_to_vendor(action, body, headers)
+        status_code, vendor_response = await forward_to_vendor(action, body)
         return JSONResponse(content=vendor_response, status_code=status_code)
     except httpx.TimeoutException:
         logger.error("Vendor API timed out")
@@ -295,9 +342,8 @@ async def _proxy(action: str, request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=422, detail={"success": False, "message": "Invalid JSON body"})
-    headers = dict(request.headers)
     try:
-        status_code, vendor_response = await forward_to_vendor(action, body, headers)
+        status_code, vendor_response = await forward_to_vendor(action, body)
         return JSONResponse(content=vendor_response, status_code=status_code)
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail={"success": False, "message": "Vendor API timed out"})
